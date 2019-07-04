@@ -1,0 +1,399 @@
+---
+title: "text2vec package with Reddit Worldnews."
+author: "Carlos Ahumada"
+date: "April 8th, 2019"
+output:
+  html_notebook:
+    toc: true 
+    toc_depth: 3  
+    theme: united  
+    highlight: tango  
+---
+
+
+```{r include=FALSE}
+library(text2vec)
+library(data.table)
+library (lubridate)
+library (magrittr)
+library (stopwords)
+library (stringr)
+```
+#Description
+Reddit is a social network which divides topics into so called 'subreddits'. On these subreddits, users can upvote or down-vote each post. According to Reddit instructions: "[...]If you think something contributes to conversation, upvote it. If you think it does not contribute to the subreddit it is posted in or is off-topic in a particular community, downvote it". 
+
+To test the text2vec R package, a dataset containing the title of the posts from  2008 to 2016 in the WorldNews subreddit obtained from [kaggle](https://www.kaggle.com/rootuser/worldnews-on-reddit#reddit_worldnews_start_to_2016-11-22.csv) will be used. For computational purposes, only the posts from 2016 will be taken into account. 
+
+
+#Data Preparation
+
+Since the dataset does not contain a document id, I will take the time created column as the document id. However, 174 posts from the ~81k in total were created at the same time, and for so cannot be uniquely identified by this variable. For so, I will get rid of those posts that were created at the same time. By doing this transformation, I will end up with a corpus of 81,718 world news posts. Furtheremore, the feature that I will analize is whether a post was upvoted more than the median (5 upvotes) or not. This can be interpreted as a feature that indicates whether an article had big or low impact among the Reddit community. 
+```{r include=FALSE}
+#Dataset
+news <- read.csv("C:/Users/carlo/Desktop/reddit.csv", encoding ="UTF-8")
+news$date_created <- as.character(news$date_created)
+news$date_created <- as.Date(news$date_created, "%m/%d/%Y")
+news <- news[news$date_created >= "2016-01-01", ]
+table(duplicated(news$time_created))
+news <- news[!(duplicated(news$time_created)), ]
+news <- news[ , c("time_created", "up_votes", "title")]
+class(news$up_votes)
+median(news$up_votes)
+news$impact <- ifelse(news$up_votes > 5, 1, 0)
+```
+
+```{r include=FALSE}
+#Setting keynames and splitting dataset
+setDT(news)
+setkey(news, time_created)
+set.seed(1628)
+all_ids = news$time_created
+train_ids = sample(all_ids, 57202) #Train set as 70% of total news
+test_ids = setdiff(all_ids, train_ids) #Test set 30% of total news
+train = news[J(train_ids)]
+test = news[J(test_ids)]
+```
+
+After splitting the dataset into train and test set, let's create the vocabulary for the creation of the DocumenT-Term-Matrix
+```{r}
+#Define preprocessing function and tokenization function
+prep_fun = tolower
+tok_fun = word_tokenizer
+train$title <- as.character(train$title)
+it_train = itoken(train$title, 
+             preprocessor = prep_fun, 
+             tokenizer = tok_fun, 
+             ids = train$time_created, 
+             progressbar = FALSE)
+vocab = create_vocabulary(it_train) #Creating vocabulary for the train set
+vocab
+```
+
+#Document-Term Matrix construction
+Now I create a DTM for the train set with 57202 news as the rows, and 32879 words as columns. 
+```{r}
+#DTM Construction for train set
+vectorizer = vocab_vectorizer(vocab)
+dtm_train = create_dtm(it_train, vectorizer)
+train$time_created <- as.character (train$time_created)
+dim(dtm_train)
+```
+
+#Logistic Regression
+Now I fit a logistic regression with the impact (1-above upvote median or 0-below upvote median) 
+```{r}
+library(glmnet)
+NFOLDS = 4
+logit = cv.glmnet(x = dtm_train, y = train[['impact']], 
+                              family = 'binomial', 
+                              # L1 penalty
+                              alpha = 1,
+                              # interested in the area under ROC curve
+                              type.measure = "auc",
+                              # 5-fold cross-validation
+                              nfolds = NFOLDS,
+                              # high value is less accurate, but has faster training
+                              thresh = 1e-3,
+                              # again lower number of iterations for faster training
+                              maxit = 1e3)
+plot(logit)
+```
+
+Now lets find the highest value for the AUC
+```{r echo=FALSE}
+print(paste("max AUC =", round(max(logit$cvm), 4)))
+```
+Now, let's assess the performance of the logistic regression on the test set. To do so, we have to create a DTM for the test set following the same logic as with the train set. The difference now will be the application of pipes from the magrittR package. 
+
+```{r}
+#DTM for test
+it_test = test$title %>% 
+  prep_fun %>% 
+  tok_fun %>% 
+  itoken(ids = test$time_created)
+
+dtm_test = create_dtm(it_test, vectorizer)
+
+preds = predict(logit, dtm_test, type = 'response')[,1]
+glmnet:::auc(test$impact, preds)
+```
+The performance of the model on the test set is slightly lower than the one in the train set. However, in both sets the perfomance is rather low. This might be due to the low number of unigrams in each title. This is an indication that this particular dataset is not good to predict the impact of a post based on news. Although, the main purpose of this project is not generate models with high accuracy, but to explore the usage of the text2vec package, can we improve the acurracy by pruning the vocabulary (removing stopwords)?
+
+```{r}
+#pruning
+stop_words = stopwords('en')
+vocab = create_vocabulary(it_train, stopwords = stop_words)
+pruned_vocab = prune_vocabulary(vocab, 
+                                 term_count_min = 1, 
+                                 doc_proportion_max = 0.5,
+                                 doc_proportion_min = 0.001)
+vectorizer = vocab_vectorizer(pruned_vocab)
+# create dtm_train with new pruned vocabulary vectorizer
+dtm_train  = create_dtm(it_train, vectorizer)
+dim(dtm_train)
+```
+After prunning, we can see that the number of unique words in the train set fall drastically from 32879 to 2619. Now let's create the DTM for the test set. 
+
+```{r include=FALSE}
+dtm_test   = create_dtm(it_test, vectorizer)
+dim(dtm_test)
+```
+
+But what happens if instead of using unigrams we use bigrams? This might also help to improve the model. 
+
+```{r include=FALSE}
+#Creating new vocabulary
+vocab = create_vocabulary(it_train, ngram = c(1L, 2L))
+vocab = vocab %>% prune_vocabulary(term_count_min = 1, 
+                   doc_proportion_max = 0.5)
+
+bigram_vectorizer = vocab_vectorizer(vocab)
+dtm_train = create_dtm(it_train, bigram_vectorizer)
+dim(dtm_train)
+```
+Naturally, the vocabulary increases substantially. Now let's run the logistic regression based on the new DTM with prunned vocabulary and bigrams.
+
+```{r}
+logit2 = cv.glmnet(x = dtm_train, y = train[['impact']], 
+                 family = 'binomial', 
+                 alpha = 1,
+                 type.measure = "auc",
+                 nfolds = NFOLDS,
+                 thresh = 1e-3,
+                 maxit = 1e3)
+plot(logit2)
+```
+
+```{r echo=FALSE}
+print(paste("max AUC =", round(max(logit2$cvm), 4)))
+```
+With this new DTM, the max AUC is 0.6231, slightly lower than the AUC with the unprunned and unigram vocabulary. Now let's see if this model performs better or worse on the test set. 
+
+```{r}
+#new DTM
+dtm_test = create_dtm(it_test, bigram_vectorizer)
+preds = predict(logit2, dtm_test, type = 'response')[,1]
+glmnet:::auc(test$impact, preds)
+```
+
+With these new DTMs the acurracy falls from 0.622 to 0.615. Again, this might be due to the small number of words per title of the posts. 
+
+
+#Feature Hashing
+
+Feature Hashing is a technique developed by the Yahoo! team. This method allows to optimize the search of terms by using an algorithm that classifies observations with keys and information inside of them. the text2vec package allows to use feature hashing: 
+
+```{r}
+#Creating hash vectorizer
+h_vectorizer = hash_vectorizer(hash_size = 2 ^ 14, ngram = c(1L, 2L))
+
+#Creating DTM with feature hashing train set
+dtm_train = create_dtm(it_train, h_vectorizer)
+
+#Running logistic regression 
+logit3 = cv.glmnet(x = dtm_train, y = train[['impact']], 
+                             family = 'binomial', 
+                             alpha = 1,
+                             type.measure = "auc",
+                             nfolds = 5,
+                             thresh = 1e-3,
+                             maxit = 1e3)
+plot(logit3)
+```
+
+```{r echo=FALSE}
+print(paste("max AUC =", round(max(logit3$cvm), 4)))
+```
+With feature hashing, the logistic model performs even worse. But let's try the model anyway on the test set. 
+
+```{r}
+#Creating DTM with feature hashing test set
+dtm_test = create_dtm(it_test, h_vectorizer)
+preds = predict(logit3, dtm_test , type = 'response')[, 1]
+glmnet:::auc(test$impact, preds)
+```
+As expected, the performance on the test set is also lower than the one seen in the previous models. 
+
+#Normalization
+Normalization is a transformation that is in place when the length of the documents, in this case, the titles of the posts, differ. This adjustment might be good for the performance of models. 
+
+```{r}
+#The L1 normalization parameter is the one that indicates that a normalization based on the length of the documents should occur. 
+dtm_train_norm = normalize(dtm_train, "l1")
+```
+
+#TF-IDF
+TF-IDF is a technique that apart from performing a normalization, also increases the weight of terms which are specific to a single document or handful of documents and decreases the weight for terms used in most documents. In the next code chunk, after defining the vocabulary and vectorizing it, we createn empty model. The, with the fit transform function, we can pass a dtm and fit the model. Afterwards, we can use this fitted model in unseen new data (test set). Finally, we run a logistic regression with the new dtm based on tf-idfs. 
+
+```{r include=FALSE}
+vocab = create_vocabulary(it_train)
+vectorizer = vocab_vectorizer(vocab)
+dtm_train = create_dtm(it_train, vectorizer)
+
+# define tfidf model
+tfidf = TfIdf$new()
+# fit model to train data and transform train data with fitted model
+dtm_train_tfidf = fit_transform(dtm_train, tfidf)
+# tfidf modified by fit_transform() call!
+# apply pre-trained tf-idf transformation to test data
+dtm_test_tfidf  = create_dtm(it_test, vectorizer) %>% 
+  transform(tfidf)
+```
+
+```{r}
+#Logistic regression
+logit4 = cv.glmnet(x = dtm_train_tfidf, y = train[['impact']], 
+                              family = 'binomial', 
+                              alpha = 1,
+                              type.measure = "auc",
+                              nfolds = NFOLDS,
+                              thresh = 1e-3,
+                              maxit = 1e3)
+plot(logit4)
+```
+
+```{r echo=FALSE}
+print(paste("max AUC =", round(max(logit4$cvm), 4)))
+```
+
+Now let?s assess the performance of the model on the test set...
+
+```{r}
+preds = predict(logit4, dtm_test_tfidf, type = 'response')[,1]
+glmnet:::auc(test$impact, preds)
+```
+The acurracy of the model is 60.70%, which is pretty close to the performance of the previous models. As it is stated in the text2vec guide: Usually tf-idf transformation significantly improve performance on most of the dowstream tasks.
+
+#Collocations
+The definition of collocations in Wikipedia is: "Within the area of corpus linguistics, collocation is defined as a sequence of words or terms which co-occur more often than would be expected by chance. 'Crystal clear', 'middle management', 'nuclear family', and 'cosmetic surgery' are examples of collocated pairs of words. Some words are often found together because they make up a compound noun, for example 'riding boots' or 'motor cyclist'".
+
+```{r}
+model = Collocations$new(collocation_count_min = 50)
+news$title <- as.character(news$title)
+txt = news$title
+it = itoken(txt)
+model$fit(it, n_iter = 3)
+model$collocation_stat
+```
+As it can be seen in the table above, most of the collocations refer to proper names. Mossack Fonseca, the Panamanian Law firm involved in the Panama Papers scandale is the collocation with the highest pmi score.PMI has been used for finding collocations and associations between words. For instance, countings of occurrences and co-occurrences of words in a text corpus can be used to approximate the probabilities p(x) and p(x,y) respectively.
+
+#Naive model for collocations
+Now let's see how does the Naive model performs.The output of the code chunk below is the texts of our corpus divided 
+
+```{r}
+set.seed(123)
+news2 <- news[sample(nrow(news),3), ]
+test_txt <- news2$title
+it = itoken(test_txt, n_chunks = 1, progressbar = FALSE)
+it_phrases = model$transform(it)
+it_phrases$nextElem()
+```
+In this example, by selecting randomly three documents of the corpus and running the naive model, we find that in document number three, the words South, China, and Sea are taked as a single term grouped in "South_China_Sea". 
+
+It might be the case that sometimes the model picks up terms like "on_suspicion" located in document 2, as a single term when in reality is not. A solution might be to remove stopwords or to keep tracking what model learned after each pass over the data. The partial fit function can be used for this purpose. This process also prunes bad phrases after each iteration. 
+
+Now, to provide an example of this method, I am going to randomly select 2000 observations from the news dataset. 
+
+```{r}
+set.seed(123)
+news3 <- news[sample(nrow(news),2000), ]
+it = itoken(news3$title)
+v = create_vocabulary(it, stopwords = stopwords("en"))
+v = prune_vocabulary(v, term_count_min = 10)
+model2 = Collocations$new(vocabulary = v, collocation_count_min = 5, pmi_min = 0)
+model2$partial_fit(it)
+model2$collocation_stat
+```
+Although this model works better than the naive approach, it continues to provide some "bad phrases". To solve this problem, one could easily manually prune the table by filtering it based on other scores such as gensim, llr or lfmd. It is important to notice that some collocations are not good because of encoding issues. 
+
+```{r}
+temp = model2$collocation_stat[pmi >= 5.5 & gensim >= 15 & lfmd >= -15, ]
+temp
+```
+Now, the collocations, although not perfect, they are cleaner than before. If we are happy with the results, we can prune learned collections. Then, one could continue training the mode as many times as necessary to obtain the desired values to obtain good collocations.
+
+```{r}
+#Setting the minimum values for the scores in the generation of collocations. 
+model2$prune(pmi_min = 5.5, gensim_min = 15, lfmd_min = -15)
+
+#Training the model once again
+model2$partial_fit(it)
+model2$prune(pmi_min = 5.5, gensim_min = 15, lfmd_min = -15)
+model2$collocation_stat
+
+```
+
+#Usage
+
+This kind of collocations can be applied in "downstream" tasks such as topic models or word embeddings. To do that, we need to create a vocabulary based on these collocations.
+
+```{r}
+it_phrases = model2$transform(it)
+vocabulary_with_phrases = create_vocabulary(it_phrases, stopwords = stop_words)
+vocabulary_with_phrases = prune_vocabulary(vocabulary_with_phrases, term_count_min = 5)
+vocabulary_with_phrases[startsWith(vocabulary_with_phrases$term, "South_"), ]
+```
+
+With this method, we can count the number of appearances of collocation that interest us, and the number of documents in which they appear. 
+
+
+#Word Embeddings with Collocations
+Word embeddings can be understood, partially, as vector representations of words. They are useful to identify the words that appear in the ame context. By identifying words that appear in the same context we can interpret their meaning. To start creating word embeddings, we need first to create a new TCM with the words and multi-word phrases, and then train the word embeddings model. 
+
+```{r}
+#TCM
+tcm = create_tcm(it_phrases, vocab_vectorizer(vocabulary_with_phrases))
+
+#Now we have a TCM matrix and can factorize it via the GloVe algorithm. text2vec uses a parallel stochastic gradient descent algorithm.
+
+#Model
+glove = GloVe$new(40, vocabulary = vocabulary_with_phrases, x_max = 5)
+wv_main = glove$fit_transform(tcm, 5)
+wv_context = glove$components
+wv = wv_main + t(wv_context)
+
+#Finding word embeddings
+cos_sim = sim2(x = wv, y = wv["Human_Rights", , drop = FALSE], method = "cosine", norm = "l2")
+head(sort(cos_sim[,1], decreasing = TRUE), 10)
+
+```
+Now, using word embeddings, one can find the terms that are close to whatever collocation we want. In the example above, "Human_Rights" is very close (in terms of words embeddings) to UN, India, Citizens, Australia, and so on. 
+
+#Topic Models with Collocations
+To create topic models with collocations we only need to create a DTM and fit a LDA model. 
+
+```{r}
+#Preparing DTM
+prep_fun = function(x) {
+  stringr::str_replace_all(tolower(x), "[^[:alpha:]]", " ")
+}
+it = itoken(news$title, preprocessor = prep_fun, tokenizer = word_tokenizer, 
+            ids = news$time_created, progressbar = FALSE)
+it = model2$transform(it)
+v = create_vocabulary(it, stopwords = stop_words)
+v = prune_vocabulary(v, term_count_min = 5, doc_proportion_min = 0.0001)
+
+#finding words
+word_count_per_token = sapply(strsplit(v$term, "_", T), length)
+v$term[word_count_per_token > 1]
+
+```
+
+By doing the process described above, we look for collocations that were found by training in the model in the larger dataset. Now we can create the dtm and fit the LDA model. 
+
+```{r eval=FALSE}
+N_TOPICS = 7
+vectorizer = vocab_vectorizer(v)
+dtm = create_dtm(it, vectorizer)
+lda = LDA$new(N_TOPICS)
+doc_topic = lda$fit_transform(dtm)
+```
+
+```{r include=FALSE}
+sessionInfo()
+```
+
+
+
+
+
